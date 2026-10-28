@@ -23,6 +23,17 @@ npm run build      # xuất ra dist/
 npm run preview    # http://localhost:4173
 ```
 
+## Tính năng
+
+- **Không giới hạn dung lượng**: đọc ZIP/APK bằng `@zip.js/zip.js` qua `Blob.slice` (chỉ nạp mục lục, giải nén từng mục khi cần, hỗ trợ ZIP64). Đã thử với APK 260 MB.
+- **Giải mã AndroidManifest.xml nhị phân** (và mọi `res/*.xml`): package, version, min/target SDK, màn hình chính, quyền (đánh dấu quyền nhạy cảm), activity/service/receiver/provider và cái nào `exported`, cảnh báo `debuggable` / HTTP không mã hóa.
+- **Phát hiện chữ ký** v1 / v2 / v3 / v3.1 / source stamp (không xác minh chứng chỉ).
+- **Mã băm toàn tệp** MD5 / SHA-1 / SHA-256, tính theo khúc 8 MB bằng `hash-wasm`.
+- **Dung lượng theo nhóm** (dex, native, res, assets…) và danh sách ABI; sắp xếp "nặng nhất trước".
+- Xem trước ảnh và văn bản/XML (tới 8 MB), tải riêng từng mục, danh sách phân trang (500 mục/lần) cho APK hàng chục nghìn tệp.
+- Xuất ZIP đã chọn: Chrome/Edge desktop ghi thẳng ra đĩa (xuất được nhiều GB), trình duyệt khác dùng Blob.
+- Nhận thêm `.xapk` / `.apks` / `.aab` ở tab APK.
+
 ## Những gì đã đổi so với bản gốc
 
 - `vite.config.ts`: bỏ yêu cầu biến `PORT`/`BASE_PATH` và các plugin Replit; dùng `base: './'`

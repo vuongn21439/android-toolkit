@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import JSZip from 'jszip';
+import { BlobReader, BlobWriter, Uint8ArrayWriter, ZipReader, ZipWriter, type FileEntry } from '@zip.js/zip.js';
 import {
   Archive,
   ArrowDownToLine,
@@ -7,6 +7,8 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleHelp,
+  Download,
+  Eye,
   Code2,
   FileArchive,
   FileCode2,
@@ -21,16 +23,23 @@ import {
   X,
 } from 'lucide-react';
 import NotFound from '@/pages/not-found';
+import { ApkInsights, HashCard, fmt, type CatStat } from '@/components/apk-insights';
+import { category, hashFile, readSigning, summarize, type CatKey, type Hashes, type ManifestInfo, type Signing } from '@/lib/apk';
+import { isAxml, parseAxml, toArrayBuffer, toXml } from '@/lib/axml';
 import { Route, Switch, Router as WouterRouter } from 'wouter';
 import { useHashLocation } from 'wouter/use-hash-location';
 
 type Mode = 'apk' | 'project';
 type ProgressState = { label: string; percent: number } | null;
-type EntryRecord = { key: string; path: string; file: JSZip.JSZipObject };
+type EntryRecord = { key: string; path: string; entry: FileEntry; size: number; packed: number };
+type Preview = { path: string; text?: string; image?: string };
 type Marker = { label: string; path: string; found: boolean; detail: string };
 
-const MAX_FILE_BYTES = 200 * 1024 * 1024;
-const MAX_PREVIEW_BYTES = 128 * 1024;
+const MAX_TEXT_BYTES = 8 * 1024 * 1024;
+const MAX_IMAGE_BYTES = 16 * 1024 * 1024;
+const PAGE_SIZE = 500;
+const TEXT_EXT = ['txt', 'xml', 'md', 'gradle', 'kts', 'properties', 'json', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'csv', 'html', 'js', 'css', 'smali', 'pro', 'version', 'mf', 'sf'];
+const IMAGE_EXT: Record<string, string> = { png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', bmp: 'image/bmp' };
 
 function normalizeArchivePath(raw: string): string | null {
   const replaced = raw.replace(/\\/g, '/');
@@ -45,24 +54,27 @@ function normalizeArchivePath(raw: string): string | null {
   return safe.join('/') + (raw.endsWith('/') && safe.length ? '/' : '');
 }
 
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
+const formatBytes = fmt;
 
 function safeFilename(name: string, fallback: string): string {
   return name.replace(/[^\w.-]+/g, '-').replace(/^-+|-+$/g, '') || fallback;
 }
 
-function canPreview(path: string, size: number): boolean {
-  if (size > MAX_PREVIEW_BYTES) return false;
-  const extension = path.split('.').pop()?.toLowerCase() || '';
-  return ['txt', 'xml', 'md', 'gradle', 'kts', 'properties', 'json', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'csv'].includes(extension);
+const extOf = (path: string) => path.split('.').pop()?.toLowerCase() || '';
+
+function previewKind(path: string, size: number): 'text' | 'image' | null {
+  const ext = extOf(path);
+  if (IMAGE_EXT[ext]) return size <= MAX_IMAGE_BYTES ? 'image' : null;
+  return TEXT_EXT.includes(ext) && size <= MAX_TEXT_BYTES ? 'text' : null;
 }
 
-function entrySize(entry: JSZip.JSZipObject): number {
-  return (entry as JSZip.JSZipObject & { _data?: { uncompressedSize?: number } })._data?.uncompressedSize ?? 0;
+function saveBlob(blob: Blob, name: string) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = name;
+  anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
 
 function Home() {
@@ -71,14 +83,20 @@ function Home() {
   const [entries, setEntries] = useState<EntryRecord[]>([]);
   const [directoryPaths, setDirectoryPaths] = useState<string[]>([]);
   const [selected, setSelected] = useState<string[]>([]);
+  const [sort, setSort] = useState<'path' | 'size'>('path');
+  const [limit, setLimit] = useState(PAGE_SIZE);
+  const [manifest, setManifest] = useState<ManifestInfo | null>(null);
+  const [signing, setSigning] = useState<Signing | null>(null);
+  const [hashes, setHashes] = useState<Hashes | null>(null);
   const [error, setError] = useState('');
   const [progress, setProgress] = useState<ProgressState>(null);
   const [query, setQuery] = useState('');
   const [filter, setFilter] = useState('all');
-  const [preview, setPreview] = useState<{ path: string; text: string } | null>(null);
+  const [preview, setPreview] = useState<Preview | null>(null);
   const [dragging, setDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
-  const zipRef = useRef<JSZip | null>(null);
+  const zipRef = useRef<ZipReader<Blob> | null>(null);
+  const selectedSet = useMemo(() => new Set(selected), [selected]);
 
   const filteredEntries = useMemo(() => entries.filter((entry) => {
     const path = entry.path.toLowerCase();
@@ -89,7 +107,20 @@ function Home() {
       || (filter === 'asset' && path.startsWith('assets/'))
       || (filter === 'other' && !/(^|\/)classes\d*\.dex$/i.test(path) && !path.endsWith('resources.arsc') && !path.startsWith('res/') && !path.startsWith('assets/'));
     return matchesQuery && matchesFilter;
-  }), [entries, filter, query]);
+  }).sort(sort === 'size' ? (a, b) => b.size - a.size : (a, b) => a.path.localeCompare(b.path)), [entries, filter, query, sort]);
+
+  const cats = useMemo<CatStat[]>(() => {
+    const map = new Map<CatKey, CatStat>();
+    for (const e of entries) {
+      const key = category(e.path);
+      const c = map.get(key) ?? { key, count: 0, size: 0, packed: 0 };
+      c.count++; c.size += e.size; c.packed += e.packed;
+      map.set(key, c);
+    }
+    return [...map.values()].sort((a, b) => b.size - a.size);
+  }, [entries]);
+
+  const abis = useMemo(() => [...new Set(entries.map((e) => /^lib\/([^/]+)\/.+\.so$/.exec(e.path)?.[1]).filter(Boolean) as string[])].sort(), [entries]);
 
   const apkStats = useMemo(() => {
     const paths = [...entries.map(({ path }) => path), ...directoryPaths].map((path) => path.toLowerCase());
@@ -116,6 +147,37 @@ function Home() {
   }, [directoryPaths, entries]);
   const readiness = projectMarkers.filter((marker) => marker.found).length;
 
+  useEffect(() => setLimit(PAGE_SIZE), [query, filter, sort, entries]);
+
+  useEffect(() => {
+    if (!file) { setHashes(null); return; }
+    let dead = false;
+    setHashes({ progress: 0 });
+    hashFile(file, (progress) => { if (!dead) setHashes({ progress }); })
+      .then((h) => { if (!dead) setHashes({ ...h, progress: 100 }); })
+      .catch(() => { if (!dead) setHashes(null); });
+    return () => { dead = true; };
+  }, [file]);
+
+  useEffect(() => {
+    setManifest(null);
+    setSigning(null);
+    if (mode !== 'apk' || !file || !entries.length) return;
+    let dead = false;
+    const hasV1 = entries.some((e) => /^meta-inf\/[^/]+\.(rsa|dsa|ec)$/i.test(e.path));
+    void readSigning(file, hasV1).then((r) => { if (!dead) setSigning(r); });
+    const m = entries.find((e) => e.path === 'AndroidManifest.xml');
+    if (m) {
+      m.entry.getData(new Uint8ArrayWriter()).then((bytes) => {
+        const root = isAxml(bytes) ? parseAxml(toArrayBuffer(bytes)) : null;
+        if (!dead && root) setManifest(summarize(root));
+      }).catch(() => undefined);
+    }
+    return () => { dead = true; };
+  }, [mode, file, entries]);
+
+  useEffect(() => () => { if (preview?.image) URL.revokeObjectURL(preview.image); }, [preview]);
+
   useEffect(() => {
     if (!preview) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -135,6 +197,7 @@ function Home() {
     setQuery('');
     setFilter('all');
     setPreview(null);
+    void zipRef.current?.close().catch(() => undefined);
     zipRef.current = null;
     if (inputRef.current) inputRef.current.value = '';
   };
@@ -143,45 +206,29 @@ function Home() {
     if (!nextFile) return;
     setError('');
     setPreview(null);
-    if (nextFile.size > MAX_FILE_BYTES) {
-      setError('Tệp lưu trữ vượt quá giới hạn 200 MB. Hãy chọn tệp nhỏ hơn.');
-      return;
-    }
-    const expectedExtension = mode === 'apk' ? /\.apk$/i : /\.zip$/i;
+    const expectedExtension = mode === 'apk' ? /\.(apk|xapk|apks|aab)$/i : /\.zip$/i;
     if (!expectedExtension.test(nextFile.name)) {
-      setError(mode === 'apk' ? 'Hãy chọn tệp lưu trữ .apk.' : 'Hãy chọn tệp .zip của dự án Android.');
+      setError(mode === 'apk' ? 'Hãy chọn tệp .apk (hoặc .xapk / .apks / .aab).' : 'Hãy chọn tệp .zip của dự án Android.');
       return;
     }
     clearWorkspace();
-    setProgress({ label: 'Đang đọc tệp lưu trữ trên trình duyệt này', percent: 0 });
+    setProgress({ label: 'Đang đọc mục lục ZIP (không nạp cả tệp vào RAM)', percent: 0 });
     try {
-      const buffer = await new Promise<ArrayBuffer>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onprogress = (event) => {
-          if (event.lengthComputable) setProgress({ label: 'Đang đọc tệp lưu trữ trên trình duyệt này', percent: Math.round((event.loaded / event.total) * 65) });
-        };
-        reader.onerror = () => reject(new Error('Không thể đọc tệp.'));
-        reader.onload = () => reader.result instanceof ArrayBuffer ? resolve(reader.result) : reject(new Error('Không thể đọc tệp.'));
-        reader.readAsArrayBuffer(nextFile);
-      });
-      setProgress({ label: 'Đang xác thực cấu trúc tệp lưu trữ', percent: 72 });
-      const zip = await JSZip.loadAsync(buffer);
-      setProgress({ label: 'Đang lập danh sách đường dẫn an toàn', percent: 94 });
+      // zip.js đọc ngẫu nhiên qua Blob.slice → chỉ nạp mục lục, dữ liệu từng mục chỉ giải nén khi cần. Hỗ trợ ZIP64, không giới hạn dung lượng.
+      const reader = new ZipReader(new BlobReader(nextFile));
+      const all = await reader.getEntries();
       const safeEntries: EntryRecord[] = [];
       const safeDirectories: string[] = [];
-      Object.entries(zip.files).forEach(([key, archiveFile]) => {
-        const normalized = normalizeArchivePath(archiveFile.name);
-        if (!normalized) return;
-        if (archiveFile.dir) {
-          safeDirectories.push(normalized);
-          return;
-        }
-        safeEntries.push({ key, path: normalized, file: archiveFile });
-      });
+      for (const item of all) {
+        const normalized = normalizeArchivePath(item.filename);
+        if (!normalized) continue;
+        if (item.directory) { safeDirectories.push(normalized); continue; }
+        safeEntries.push({ key: item.filename, path: normalized, entry: item, size: item.uncompressedSize, packed: item.compressedSize });
+      }
       if (safeEntries.length === 0) throw new Error('Không tìm thấy tệp nào có đường dẫn an toàn trong tệp lưu trữ này.');
-      zipRef.current = zip;
+      zipRef.current = reader;
       setFile(nextFile);
-      setEntries(safeEntries.sort((a, b) => a.path.localeCompare(b.path)));
+      setEntries(safeEntries.sort((x, y) => x.path.localeCompare(y.path)));
       setDirectoryPaths(safeDirectories);
       setSelected([]);
       setProgress(null);
@@ -201,27 +248,25 @@ function Home() {
   };
 
   const downloadZip = async (all: boolean) => {
-    const source = zipRef.current;
-    if (!source || !file) return;
-    const chosen = all ? entries : entries.filter((entry) => selected.includes(entry.key));
+    if (!zipRef.current || !file) return;
+    const chosen = all ? entries : entries.filter((entry) => selectedSet.has(entry.key));
     if (!chosen.length) return;
     setError('');
-    setProgress({ label: 'Đang chuẩn bị ZIP mới trong bộ nhớ', percent: 0 });
+    const name = `${safeFilename(file.name.replace(/\.(apk|zip|xapk|apks|aab)$/i, ''), 'luu-tru')}-${all ? 'noi-dung' : 'da-chon'}.zip`;
     try {
-      const output = new JSZip();
-      for (const entry of chosen) {
-        const normalized = normalizeArchivePath(entry.path);
-        if (normalized) output.file(normalized, entry.file.async('uint8array'));
+      // Chrome/Edge desktop: ghi thẳng ra đĩa (không giữ cả ZIP trong RAM) → xuất được tệp nhiều GB.
+      const picker = (window as unknown as { showSaveFilePicker?: (o: object) => Promise<{ createWritable: () => Promise<WritableStream> }> }).showSaveFilePicker;
+      const handle = picker ? await picker({ suggestedName: name, types: [{ description: 'ZIP', accept: { 'application/zip': ['.zip'] } }] }).catch(() => null) : null;
+      if (picker && !handle) return;
+      setProgress({ label: 'Đang đóng gói ZIP mới', percent: 0 });
+      const writer = new ZipWriter(handle ? await handle.createWritable() : new BlobWriter('application/zip'), { level: 5 });
+      for (const [index, item] of chosen.entries()) {
+        const data = await item.entry.getData(new BlobWriter());
+        await writer.add(item.path, new BlobReader(data));
+        setProgress({ label: `Đang đóng gói ${index + 1}/${chosen.length}`, percent: Math.round(((index + 1) / chosen.length) * 100) });
       }
-      const blob = await output.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 5 } }, (metadata) => {
-        setProgress({ label: 'Đang tạo tệp tải xuống', percent: Math.round(metadata.percent) });
-      });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `${safeFilename(file.name.replace(/\.(apk|zip)$/i, ''), 'luu-tru')}-${all ? 'noi-dung' : 'da-chon'}.zip`;
-      anchor.click();
-      URL.revokeObjectURL(url);
+      const result = await writer.close();
+      if (!handle) saveBlob(result as Blob, name);
       setProgress(null);
     } catch {
       setProgress(null);
@@ -229,17 +274,39 @@ function Home() {
     }
   };
 
-  const openPreview = async (entry: EntryRecord) => {
-    if (!canPreview(entry.path, entrySize(entry.file))) {
-      setError('Chỉ có thể xem trước tệp cấu hình và tài liệu dạng văn bản thuần có dung lượng nhỏ.');
+  const downloadOne = async (item: EntryRecord) => {
+    try {
+      saveBlob(await item.entry.getData(new BlobWriter()), item.path.split('/').pop() || 'tep');
+    } catch {
+      setError('Không thể trích xuất mục này (có thể đã mã hóa bằng mật khẩu).');
+    }
+  };
+
+  const openPreview = async (item: EntryRecord) => {
+    const kind = previewKind(item.path, item.size);
+    if (!kind) {
+      setError('Chỉ xem trước được tệp văn bản/XML (≤ 8 MB) và ảnh (≤ 16 MB).');
       return;
     }
     try {
-      const text = await entry.file.async('text');
-      setPreview({ path: entry.path, text: text.slice(0, MAX_PREVIEW_BYTES) });
+      if (kind === 'image') {
+        const blob = await item.entry.getData(new BlobWriter(IMAGE_EXT[extOf(item.path)]));
+        setPreview({ path: item.path, image: URL.createObjectURL(blob) });
+      } else {
+        const bytes = await item.entry.getData(new Uint8ArrayWriter());
+        let text: string;
+        if (isAxml(bytes)) {
+          const root = parseAxml(toArrayBuffer(bytes));
+          if (!root) throw new Error('axml');
+          text = toXml(root);
+        } else {
+          text = new TextDecoder('utf-8').decode(bytes);
+        }
+        setPreview({ path: item.path, text: text.slice(0, 400_000) });
+      }
       setError('');
     } catch {
-      setError('Không thể giải mã mục này thành văn bản.');
+      setError('Không thể giải mã mục này để xem trước.');
     }
   };
 
@@ -265,13 +332,8 @@ function Home() {
       'Android Toolkit chỉ kiểm tra đường dẫn trong tệp lưu trữ. Công cụ không chạy Gradle, không biên dịch APK,',
       'không dịch ngược DEX thành mã nguồn và không tải dữ liệu lên máy chủ. Các dấu hiệu sẵn sàng không bảo đảm biên dịch thành công.',
     ];
-    const blob = new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' });
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = `${safeFilename(file.name.replace(/\.zip$/i, ''), 'du-an-android')}-bao-cao-kiem-tra.txt`;
-    anchor.click();
-    URL.revokeObjectURL(url);
+    if (hashes?.sha256) lines.splice(4, 0, `SHA-256: ${hashes.sha256}`);
+    saveBlob(new Blob([lines.join('\n')], { type: 'text/plain;charset=utf-8' }), `${safeFilename(file.name.replace(/\.zip$/i, ''), 'du-an-android')}-bao-cao-kiem-tra.txt`);
   };
 
   const handleDrop = (event: React.DragEvent<HTMLDivElement>) => {
@@ -320,14 +382,14 @@ function Home() {
                 onDrop={handleDrop}
                 data-testid="dropzone-archive"
               >
-                <input ref={inputRef} className="hidden-input" type="file" accept={mode === 'apk' ? '.apk' : '.zip'} onChange={(event) => void processFile(event.target.files?.[0])} data-testid="input-archive-file" aria-label={mode === 'apk' ? 'Chọn tệp APK' : 'Chọn ZIP dự án Android'} />
+                <input ref={inputRef} className="hidden-input" type="file" accept={mode === 'apk' ? '.apk,.xapk,.apks,.aab' : '.zip'} onChange={(event) => void processFile(event.target.files?.[0])} data-testid="input-archive-file" aria-label={mode === 'apk' ? 'Chọn tệp APK' : 'Chọn ZIP dự án Android'} />
                 <span className="drop-icon"><Upload size={20} /></span>
                 <h2>{mode === 'apk' ? 'Thả APK vào đây để kiểm tra nội dung' : 'Thả ZIP dự án Android vào đây'}</h2>
                 <p>{mode === 'apk' ? 'Duyệt tệp và nhận diện các thành phần thường có trong gói Android.' : 'Kiểm tra các dấu hiệu dự án và nhận hướng dẫn biên dịch thiết thực.'}</p>
                 <button type="button" className="select-button" onClick={() => inputRef.current?.click()} data-testid="button-browse-archive">
                   <Folder size={14} /> Chọn {mode === 'apk' ? 'APK' : 'ZIP'}
                 </button>
-                <span className="file-limit">Tương thích ZIP · tối đa 200 MB · xử lý trong bộ nhớ</span>
+                <span className="file-limit">Không giới hạn dung lượng · đọc từng phần, không nạp cả tệp vào RAM</span>
               </div>
 
               <div className="notice" data-testid="text-scope-warning">
@@ -359,6 +421,8 @@ function Home() {
                     </div>
                   </div>
 
+                  <ApkInsights manifest={manifest} signing={signing} cats={cats} abis={abis} hashes={hashes} />
+
                   <div className="summary-grid" data-testid="data-apk-summary">
                     <div className="summary-chip"><span>Tệp kê khai</span><strong className={apkStats.manifest ? 'present' : ''}>{apkStats.manifest ? 'Tìm thấy' : 'Không thấy'}</strong></div>
                     <div className="summary-chip"><span>Tệp DEX</span><strong className={apkStats.dex ? 'present' : ''}>{apkStats.dex ? 'Có' : 'Không thấy'}</strong></div>
@@ -372,22 +436,27 @@ function Home() {
                     <select id="entry-filter" className="filter-select" value={filter} onChange={(event) => setFilter(event.target.value)} data-testid="select-entry-filter">
                       <option value="all">Tất cả mục</option><option value="dex">Tệp DEX</option><option value="resource">Tài nguyên</option><option value="asset">Thư mục assets</option><option value="other">Khác</option>
                     </select>
-                    <span className="list-count" data-testid="text-entry-count">Đang hiển thị {filteredEntries.length}</span>
+                    <select className="filter-select" aria-label="Sắp xếp" value={sort} onChange={(event) => setSort(event.target.value as 'path' | 'size')} data-testid="select-entry-sort">
+                      <option value="path">Theo tên</option><option value="size">Nặng nhất trước</option>
+                    </select>
+                    <span className="list-count" data-testid="text-entry-count">{filteredEntries.length.toLocaleString()} mục</span>
                   </div>
                   <div className="entry-list" role="list" aria-label="Các mục trong tệp lưu trữ" data-testid="list-archive-entries">
-                    {filteredEntries.length ? filteredEntries.map((entry) => {
-                      const size = entrySize(entry.file);
-                      const previewable = canPreview(entry.path, size);
+                    {filteredEntries.length ? filteredEntries.slice(0, limit).map((entry) => {
+                      const size = entry.size;
+                      const previewable = !!previewKind(entry.path, size);
                       return (
                         <div className="entry-row" role="listitem" key={entry.key} data-testid={`row-entry-${safeFilename(entry.key, 'entry')}`}>
-                          <input className="entry-check" type="checkbox" aria-label={`Chọn ${entry.path}`} checked={selected.includes(entry.key)} onChange={() => toggleEntry(entry.key)} data-testid={`checkbox-entry-${safeFilename(entry.key, 'entry')}`} />
+                          <input className="entry-check" type="checkbox" aria-label={`Chọn ${entry.path}`} checked={selectedSet.has(entry.key)} onChange={() => toggleEntry(entry.key)} data-testid={`checkbox-entry-${safeFilename(entry.key, 'entry')}`} />
                           {entry.path.toLowerCase().endsWith('.dex') ? <Code2 size={15} className="entry-icon" /> : entry.path.toLowerCase().endsWith('.xml') ? <FileCode2 size={15} className="entry-icon" /> : <FileText size={15} className="entry-icon" />}
                           <span className="entry-path" title={entry.path}>{entry.path}</span>
                           <span className="entry-size">{formatBytes(size)}</span>
-                          {previewable && <button type="button" className="preview-button" aria-label={`Xem trước ${entry.path}`} title="Xem trước tệp văn bản nhỏ" onClick={() => void openPreview(entry)} data-testid={`button-preview-${safeFilename(entry.key, 'entry')}`}><CircleHelp size={15} /></button>}
+                          {previewable && <button type="button" className="preview-button" aria-label={`Xem trước ${entry.path}`} title="Xem trước (XML nhị phân được giải mã)" onClick={() => void openPreview(entry)} data-testid={`button-preview-${safeFilename(entry.key, 'entry')}`}><Eye size={15} /></button>}
+                          <button type="button" className="preview-button" aria-label={`Tải ${entry.path}`} title="Tải riêng mục này" onClick={() => void downloadOne(entry)}><Download size={15} /></button>
                         </div>
                       );
                     }) : <div className="empty-list" data-testid="empty-filter-results">Không có mục phù hợp. Hãy thử từ khóa hoặc bộ lọc khác.</div>}
+                    {filteredEntries.length > limit && <div className="more-row"><button type="button" className="secondary-button" onClick={() => setLimit((n) => n + PAGE_SIZE)}>Hiển thị thêm ({(filteredEntries.length - limit).toLocaleString()} mục nữa)</button></div>}
                   </div>
                   <div className="selection-bar">
                     <span>Đã chọn {selected.length} mục · tải xuống dưới dạng ZIP mới</span>
@@ -416,6 +485,7 @@ function Home() {
                       </div>
                     ))}
                   </div>
+                  <div style={{ marginTop: 14 }}><HashCard hashes={hashes} /></div>
                   <div className="notice" data-testid="text-project-guidance"><Info size={15} /><span>Danh sách này chỉ nhận diện nhanh dựa trên đường dẫn, không xác thực quá trình biên dịch. Báo cáo TXT có lệnh dùng Gradle Wrapper cục bộ; công cụ không chạy các lệnh đó.</span></div>
                 </div>
               )}
@@ -458,14 +528,14 @@ function Home() {
             </section>
           </aside>
         </div>
-        <div className="footer-note">Dành cho việc kiểm tra cục bộ các tệp được phép sử dụng. Chỉ xem trước mục văn bản nhỏ; HTML và JavaScript không bao giờ được hiển thị hay thực thi.</div>
+        <div className="footer-note">Dành cho việc kiểm tra cục bộ các tệp được phép sử dụng. Văn bản chỉ hiển thị dạng chữ thuần; ảnh hiển thị qua thẻ img. HTML và JavaScript không bao giờ được thực thi.</div>
       </main>
 
       {preview && (
         <div className="preview-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPreview(null); }}>
           <section className="preview-modal" role="dialog" aria-modal="true" aria-label={`Xem trước văn bản: ${preview.path}`} data-testid="dialog-text-preview">
             <div className="preview-head"><strong title={preview.path}>{preview.path}</strong><button type="button" className="preview-close" onClick={() => setPreview(null)} aria-label="Đóng phần xem trước" data-testid="button-close-preview"><X size={17} /></button></div>
-            <pre className="preview-content" data-testid="text-entry-preview">{preview.text}</pre>
+            {preview.image ? <img className="preview-image" src={preview.image} alt={preview.path} /> : <pre className="preview-content" data-testid="text-entry-preview">{preview.text}</pre>}
           </section>
         </div>
       )}
