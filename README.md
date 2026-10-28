@@ -41,4 +41,4 @@ npm run preview    # http://localhost:4173
 - `src/App.tsx`: router dùng hash (`#/`), tránh lỗi 404 khi tải lại trang trên GitHub Pages.
 - `package.json`: thay `catalog:` / `workspace:*` bằng phiên bản cụ thể, bỏ các gói không dùng.
 - `tsconfig.json`: độc lập, không còn `extends` / `references` ra ngoài repo.
-- Thêm `.github/workflows/deploy.yml`, `.gitignore`, `.npmrc`.
+- Thêm `.github/workflows/deploy.yml`, `.gitignore`, `.npmrc`...
